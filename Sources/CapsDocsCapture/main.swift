@@ -43,6 +43,7 @@ private struct TargetDocument: Codable {
     var title: String
     var url: String
     var bounds: WindowBounds?
+    var focusPoint: TargetFocusPoint?
     var createdAt: Date
 }
 
@@ -76,15 +77,37 @@ private struct OnScreenWindow {
     var bounds: WindowBounds
 }
 
+private struct FocusedTarget {
+    var info: BrowserWindowInfo
+    var focusPoint: TargetFocusPoint?
+}
+
 private struct WindowBounds: Codable {
     var left: Double
     var top: Double
     var right: Double
     var bottom: Double
 
-    var titlebarPoint: CGPoint {
-        CGPoint(x: left + min(220, max(80, (right - left) * 0.18)), y: top + 24)
+    func contains(_ point: CGPoint, tolerance: Double = 20) -> Bool {
+        point.x >= left - tolerance &&
+            point.x <= right + tolerance &&
+            point.y >= top - tolerance &&
+            point.y <= bottom + tolerance
     }
+
+    var width: Double { max(1, right - left) }
+    var height: Double { max(1, bottom - top) }
+
+    var documentBodyTop: Double {
+        top + min(260, max(140, height * 0.20))
+    }
+}
+
+private struct TargetFocusPoint: Codable {
+    var x: Double
+    var y: Double
+    var relativeX: Double
+    var relativeY: Double
 }
 
 private enum TargetSearchMode {
@@ -223,6 +246,7 @@ private final class CaptureController {
             title: info.title,
             url: info.url,
             bounds: info.bounds,
+            focusPoint: nil,
             createdAt: Date()
         )
 
@@ -377,7 +401,7 @@ private final class CaptureController {
         }
         log("copied \(text.count) chars")
 
-        guard focusTargetDocument() else {
+        guard let target = focusTargetDocument() else {
             snapshot.restore()
             log("no docs target available")
             notify(title: "No Google Docs target", body: "Open your notes Doc or run --set-target while it is focused.")
@@ -390,10 +414,10 @@ private final class CaptureController {
         let textToPaste = text.hasSuffix("\n") ? text : text + "\n"
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(textToPaste, forType: .string)
-        if !systemEventsKeystroke("v", usingCommand: true) {
-            keyCombo(keyCodeV, flags: .maskCommand)
-        }
-        Thread.sleep(forTimeInterval: 1.2)
+        clickTargetFocusPoint(target.focusPoint, bounds: matchingOnScreenWindow(for: target.info)?.bounds ?? target.info.bounds)
+        keyCombo(keyCodeV, flags: .maskCommand)
+        log("paste command sent via CGEvent")
+        Thread.sleep(forTimeInterval: 2.2)
         snapshot.restore()
         returnToSource(source)
         log("captured \(text.count) chars")
@@ -511,6 +535,7 @@ private func saveTarget(_ info: BrowserWindowInfo) -> Bool {
         title: info.title,
         url: info.url,
         bounds: info.bounds,
+        focusPoint: currentMouseTargetFocusPoint(bounds: info.bounds),
         createdAt: Date()
     )
 
@@ -541,6 +566,7 @@ private func setTargetBySearch(_ query: String, mode: TargetSearchMode) -> Bool 
                     title: info.title,
                     url: info.url,
                     bounds: info.bounds,
+                    focusPoint: nil,
                     createdAt: Date()
                 )
 
@@ -583,6 +609,7 @@ private func status() {
         print("Target: \(target.title)")
         print("Target app: \(target.appName)")
         print("Target URL: \(target.url)")
+        print("Target body click point: \(target.focusPoint == nil ? "not saved" : "saved")")
     } else {
         print("Target: none saved; first open Google Doc will be used")
     }
@@ -991,42 +1018,45 @@ private func readSelectedTextFromFocusedElement(source: SourceWindow) -> String?
     return text
 }
 
-private func focusTargetDocument() -> Bool {
+private func focusTargetDocument() -> FocusedTarget? {
     if let target = loadTarget() {
         log("target candidate: \(target.title) window=\(target.windowID) tab=\(target.tabIndex)")
-        if focusSavedTarget(target) {
-            return true
+        if let focused = focusSavedTarget(target) {
+            return focused
         }
         log("saved target focus failed")
     }
 
     for browser in chromiumBrowserNames {
-        if focusFirstGoogleDocsWindow(appName: browser) {
+        if let focused = focusFirstGoogleDocsWindow(appName: browser) {
             log("focused fallback docs window in \(browser)")
-            return true
+            return focused
         }
     }
 
-    return false
+    return nil
 }
 
-private func focusSavedTarget(_ target: TargetDocument) -> Bool {
+private func focusSavedTarget(_ target: TargetDocument) -> FocusedTarget? {
     if focusBrowserTab(target.browserWindowInfo) {
-        return true
+        return FocusedTarget(info: target.browserWindowInfo, focusPoint: target.focusPoint)
     }
 
-    if let window = matchingOnScreenWindow(for: target) {
+    if matchingOnScreenWindow(for: target) != nil {
         _ = bringProcessToFront(appName: target.appName)
-        clickScreenPoint(window.bounds.titlebarPoint)
+        _ = raiseProcessWindow(appName: target.appName)
+        _ = shell("/usr/bin/open -a \(shellQuoted(target.appName))")
         Thread.sleep(forTimeInterval: 0.35)
-        return isFrontmostApp(named: target.appName)
+        return waitForKeyboardFocus(appName: target.appName)
+            ? FocusedTarget(info: target.browserWindowInfo, focusPoint: target.focusPoint)
+            : nil
     }
 
     if let currentInfo = findOpenTab(url: target.url, appName: target.appName) {
-        return focusBrowserTab(currentInfo)
+        return focusBrowserTab(currentInfo) ? FocusedTarget(info: currentInfo, focusPoint: target.focusPoint) : nil
     }
 
-    return false
+    return nil
 }
 
 private func findOpenTab(url: String, appName: String) -> BrowserWindowInfo? {
@@ -1051,20 +1081,24 @@ private func googleDocumentID(_ url: String) -> String? {
     return id?.isEmpty == false ? id : nil
 }
 
-private func focusFirstGoogleDocsWindow(appName: String) -> Bool {
-    if let window = onScreenWindows(appName: appName)
-        .first(where: { $0.title.localizedCaseInsensitiveContains("Google Docs") }) {
+private func focusFirstGoogleDocsWindow(appName: String) -> FocusedTarget? {
+    if onScreenWindows(appName: appName)
+        .contains(where: { $0.title.localizedCaseInsensitiveContains("Google Docs") }) {
         _ = bringProcessToFront(appName: appName)
-        clickScreenPoint(window.bounds.titlebarPoint)
+        _ = raiseProcessWindow(appName: appName)
+        _ = shell("/usr/bin/open -a \(shellQuoted(appName))")
         Thread.sleep(forTimeInterval: 0.35)
-        return isFrontmostApp(named: appName)
+        if waitForKeyboardFocus(appName: appName),
+           let info = topOnScreenGoogleDocsWindow(appName: appName) {
+            return FocusedTarget(info: info, focusPoint: nil)
+        }
     }
 
     if let info = topOnScreenGoogleDocsWindow(appName: appName) {
-        return focusBrowserTab(info)
+        return focusBrowserTab(info) ? FocusedTarget(info: info, focusPoint: nil) : nil
     }
 
-    return false
+    return nil
 }
 
 private func currentOnScreenGoogleDocsWindow() -> BrowserWindowInfo? {
@@ -1123,11 +1157,9 @@ private func focusBrowserTab(_ info: BrowserWindowInfo) -> Bool {
         return false
     }
 
-    if let bounds = matchingOnScreenWindow(for: info)?.bounds ?? info.bounds {
-        clickScreenPoint(bounds.titlebarPoint)
-        Thread.sleep(forTimeInterval: 0.2)
-    }
-    let front = isFrontmostApp(named: info.appName)
+    _ = raiseProcessWindow(appName: info.appName)
+    _ = shell("/usr/bin/open -a \(shellQuoted(info.appName))")
+    let front = waitForKeyboardFocus(appName: info.appName)
     log("target front check: \(front ? "ok" : "failed") ns=\(NSWorkspace.shared.frontmostApplication?.localizedName ?? "(none)") se=\(systemEventsFrontmostProcessName() ?? "(none)")")
     return front
 }
@@ -1200,6 +1232,24 @@ private func bringProcessToFront(appName: String) -> Bool {
     return runAppleScript(script)?.trimmingCharacters(in: .whitespacesAndNewlines) == "ok"
 }
 
+private func raiseProcessWindow(appName: String) -> Bool {
+    let script = """
+    tell application "System Events"
+      tell process "\(appleScriptEscaped(appName))"
+        try
+          perform action "AXRaise" of window 1
+        end try
+        try
+          set frontmost to true
+        end try
+      end tell
+    end tell
+    return "ok"
+    """
+
+    return runAppleScript(script, timeout: 1.0)?.trimmingCharacters(in: .whitespacesAndNewlines) == "ok"
+}
+
 private func activateApp(appName: String, bundleIdentifier: String?) -> Bool {
     if let bundleIdentifier,
        let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier).first {
@@ -1225,6 +1275,24 @@ private func activateApp(appName: String, bundleIdentifier: String?) -> Bool {
     Thread.sleep(forTimeInterval: 0.3)
     return NSWorkspace.shared.frontmostApplication?.localizedName == appName ||
         systemEventsFrontmostProcessName() == appName
+}
+
+private func waitForKeyboardFocus(appName: String, timeout: TimeInterval = 1.6) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    var sawNSFrontmost = false
+    while Date() < deadline {
+        let nsFrontmost = NSWorkspace.shared.frontmostApplication?.localizedName
+        let seFrontmost = systemEventsFrontmostProcessName()
+        if nsFrontmost == appName, seFrontmost == appName {
+            return true
+        }
+        if nsFrontmost == appName {
+            sawNSFrontmost = true
+        }
+        Thread.sleep(forTimeInterval: 0.05)
+    }
+
+    return sawNSFrontmost || NSWorkspace.shared.frontmostApplication?.localizedName == appName
 }
 
 private func systemEventsFrontmostProcessName() -> String? {
@@ -1276,7 +1344,7 @@ private func saveTarget(_ target: TargetDocument) -> Bool {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
         try encoder.encode(target).write(to: targetFile, options: .atomic)
-        log("saved target: \(target.title) \(target.url)")
+        log("saved target: \(target.title) \(target.focusPoint == nil ? "without body point" : "with body point") \(target.url)")
         return true
     } catch {
         log("target save error: \(error)")
@@ -1331,9 +1399,70 @@ private func clickScreenPoint(_ point: CGPoint) {
         .post(tap: .cghidEventTap)
 }
 
-private func systemEventsKeystroke(_ character: String, usingCommand: Bool) -> Bool {
+private func currentMouseTargetFocusPoint(bounds: WindowBounds?) -> TargetFocusPoint? {
+    guard let bounds,
+          let mouseEvent = CGEvent(source: nil) else {
+        return nil
+    }
+
+    let point = mouseEvent.location
+    guard bounds.contains(point, tolerance: 0),
+          point.y >= bounds.documentBodyTop,
+          point.y <= bounds.bottom - 20,
+          point.x >= bounds.left + 40,
+          point.x <= bounds.right - 40 else {
+        return nil
+    }
+
+    return TargetFocusPoint(
+        x: point.x,
+        y: point.y,
+        relativeX: (point.x - bounds.left) / bounds.width,
+        relativeY: (point.y - bounds.top) / bounds.height
+    )
+}
+
+private func clickTargetFocusPoint(_ focusPoint: TargetFocusPoint?, bounds: WindowBounds?) {
+    guard let focusPoint,
+          let bounds else {
+        log("no saved target body click point")
+        return
+    }
+
+    let point = CGPoint(
+        x: bounds.left + bounds.width * focusPoint.relativeX,
+        y: bounds.top + bounds.height * focusPoint.relativeY
+    )
+
+    guard bounds.contains(point, tolerance: 0),
+          point.y >= bounds.documentBodyTop,
+          point.y <= bounds.bottom - 20,
+          point.x >= bounds.left + 40,
+          point.x <= bounds.right - 40 else {
+        log("saved target body click point ignored")
+        return
+    }
+
+    clickScreenPoint(point)
+    Thread.sleep(forTimeInterval: 0.15)
+    log("clicked saved target body point")
+}
+
+private func systemEventsKeystroke(_ character: String, usingCommand: Bool, targetProcessName: String? = nil) -> Bool {
     let modifiers = usingCommand ? " using command down" : ""
-    let script = #"tell application "System Events" to keystroke "\#(appleScriptEscaped(character))"\#(modifiers)"#
+    let script: String
+    if let targetProcessName {
+        script = """
+        tell application "System Events"
+          tell process "\(appleScriptEscaped(targetProcessName))"
+            set frontmost to true
+            keystroke "\(appleScriptEscaped(character))"\(modifiers)
+          end tell
+        end tell
+        """
+    } else {
+        script = #"tell application "System Events" to keystroke "\#(appleScriptEscaped(character))"\#(modifiers)"#
+    }
 
     let task = Process()
     task.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
@@ -1437,7 +1566,7 @@ private func log(_ message: String) {
     if FileManager.default.fileExists(atPath: logFile.path),
        let handle = try? FileHandle(forWritingTo: logFile) {
         defer { try? handle.close() }
-        try? handle.seekToEnd()
+        _ = try? handle.seekToEnd()
         try? handle.write(contentsOf: data)
     } else {
         try? data.write(to: logFile)

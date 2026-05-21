@@ -6,8 +6,8 @@ Google Docs.
 ## Workflow
 
 1. Start the daemon.
-2. Click in the Google Doc where notes should be inserted.
-3. Press Shift-Caps Lock to save that Docs window as the target.
+2. Click in the Google Doc body where notes should be inserted.
+3. Press Shift-Caps Lock to save that Docs window and body click point as the target.
 4. Highlight text in another app or browser window.
 5. Press Caps Lock to paste the selected text into the saved Docs target.
 
@@ -80,7 +80,9 @@ Save the currently focused Google Doc as the target:
 ~/Library/Application\ Support/CapsDocsCapture/CapsDocsCapture --set-target
 ```
 
-When the daemon is running, Shift-Caps Lock does the same thing.
+When the daemon is running, Shift-Caps Lock does the same thing. The mouse
+must be inside the document body, not on the toolbar or browser tabs, so the
+helper can safely refocus the editor before pasting.
 
 Save a specific open Google Doc by URL or document ID:
 
@@ -90,7 +92,9 @@ Save a specific open Google Doc by URL or document ID:
 
 Quote full URLs. In zsh, an unquoted `?tab=t.0` is treated as a filename
 pattern before CapsDocsCapture can read it. Passing only the document ID avoids
-that issue.
+that issue. This command saves the document target only; use Shift-Caps Lock
+after clicking in the document body when `--status` shows `Target body click
+point: not saved`.
 
 List open Google Docs:
 
@@ -127,8 +131,9 @@ running:
 - Shift-Caps Lock: save the focused Google Docs window as the target.
 
 The helper intentionally uses the live Google Docs cursor instead of the Google
-Docs API. The target Docs window should be visible or focusable, and its cursor
-should already be placed where the next capture should land.
+Docs API. The target Docs window should be visible or focusable. For reliable
+pasting, save a target body click point with Shift-Caps Lock after placing the
+cursor where the next capture should land.
 
 The daemon runs interactively instead of as a LaunchAgent. On current macOS, a
 LaunchAgent process can start but may not receive the same
