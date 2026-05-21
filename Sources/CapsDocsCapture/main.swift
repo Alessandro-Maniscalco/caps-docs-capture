@@ -19,10 +19,11 @@ private let karabinerEnabledVariable = "caps_docs_capture_enabled"
 private let daemonAutoQuitInterval: TimeInterval = 60 * 60
 
 private let keyCodeC: CGKeyCode = 8
+private let keyCodeL: CGKeyCode = 37
 private let keyCodeV: CGKeyCode = 9
+private let keyCodeReturn: CGKeyCode = 36
 private let keyCodeCommand: CGKeyCode = 55
 private let keyCodeF18: CGKeyCode = 79
-private let keyCodeCapsLock: CGKeyCode = 57
 private let eventTypeSystemDefinedRawValue: UInt32 = 14
 private let hidUsagePageKeyboardOrKeypad: UInt32 = 0x07
 private let hidUsageKeyboardCapsLock: UInt32 = 0x39
@@ -80,6 +81,7 @@ private struct OnScreenWindow {
 private struct FocusedTarget {
     var info: BrowserWindowInfo
     var focusPoint: TargetFocusPoint?
+    var restoreSource: BrowserWindowInfo?
 }
 
 private struct WindowBounds: Codable {
@@ -362,9 +364,6 @@ private final class CaptureController {
         if type == .keyDown, keyCode == keyCodeF18 {
             log("event tap F18")
             triggerCapture(sourceProcessIdentifier: eventTargetProcessIdentifier(event))
-        } else if type == .flagsChanged, keyCode == keyCodeCapsLock {
-            log("event tap caps lock")
-            triggerCapture(sourceProcessIdentifier: eventTargetProcessIdentifier(event))
         }
     }
 
@@ -376,10 +375,8 @@ private final class CaptureController {
 
         guard pressed, usagePage == hidUsagePageKeyboardOrKeypad else { return }
 
-        if usage == hidUsageKeyboardCapsLock {
-            log("hid caps lock")
-            triggerCapture()
-        }
+        guard usage == hidUsageKeyboardCapsLock else { return }
+        log("hid caps lock ignored; Karabiner owns Caps Lock capture")
     }
 
     func captureOnce(sourceProcessIdentifier: pid_t? = nil) -> Bool {
@@ -389,7 +386,12 @@ private final class CaptureController {
 
         log("capture begin")
         let source = currentSourceWindow(processIdentifier: sourceProcessIdentifier)
+        let sourceBrowser = currentVisibleBrowserWindowInfo(appName: source.appName, bundleIdentifier: source.bundleIdentifier) ??
+            currentBrowserWindowInfo(appName: source.appName, bundleIdentifier: source.bundleIdentifier)
         log("source app: \(source.appName.isEmpty ? "(unknown)" : source.appName)")
+        if let sourceBrowser {
+            log("source browser: \(sourceBrowser.title) \(sourceBrowser.url)")
+        }
         let snapshot = PasteboardSnapshot()
 
         guard let text = readSelectedTextFromFocusedElement(source: source) ?? copySelectedText(),
@@ -401,7 +403,7 @@ private final class CaptureController {
         }
         log("copied \(text.count) chars")
 
-        guard let target = focusTargetDocument() else {
+        guard let target = focusTargetDocument(sourceBrowser: sourceBrowser) else {
             snapshot.restore()
             log("no docs target available")
             notify(title: "No Google Docs target", body: "Open your notes Doc or run --set-target while it is focused.")
@@ -410,16 +412,21 @@ private final class CaptureController {
         log("target focused")
         log("front app after target focus: \(NSWorkspace.shared.frontmostApplication?.localizedName ?? "(unknown)")")
 
-        Thread.sleep(forTimeInterval: 0.18)
+        Thread.sleep(forTimeInterval: target.restoreSource == nil ? 0.25 : 3.0)
         let textToPaste = text.hasSuffix("\n") ? text : text + "\n"
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(textToPaste, forType: .string)
         clickTargetFocusPoint(target.focusPoint, bounds: matchingOnScreenWindow(for: target.info)?.bounds ?? target.info.bounds)
         keyCombo(keyCodeV, flags: .maskCommand)
         log("paste command sent via CGEvent")
-        Thread.sleep(forTimeInterval: 2.2)
-        snapshot.restore()
-        returnToSource(source)
+        Thread.sleep(forTimeInterval: target.restoreSource == nil ? 2.5 : 5.0)
+        if let restoreSource = target.restoreSource {
+            restoreBrowserSource(restoreSource)
+            snapshot.restore()
+        } else {
+            snapshot.restore()
+            returnToSource(source)
+        }
         log("captured \(text.count) chars")
         return true
     }
@@ -483,17 +490,27 @@ private func triggerDaemon() {
     )
 }
 
-private func setTargetToFrontDocument() -> Bool {
+private func setTargetToFrontDocument(allowWait: Bool = false) -> Bool {
     ensureSupportDirectory()
 
+    if let info = currentMouseGoogleDocsWindow(requireSupportedFrontApp: false),
+       currentMouseTargetFocusPoint(bounds: info.bounds) != nil {
+        return saveTarget(info)
+    }
     if let info = currentBrowserWindowInfo(), isGoogleDocumentURL(info.url) {
         return saveTarget(info)
     }
-    if let info = currentMouseGoogleDocsWindow(requireSupportedFrontApp: true) {
+    if let info = currentMouseGoogleDocsWindow(requireSupportedFrontApp: false) {
         return saveTarget(info)
     }
     if let info = currentAccessibilityGoogleDocsWindow() {
         return saveTarget(info)
+    }
+
+    guard allowWait else {
+        fputs("No focused Google Docs window found. Click inside the Google Doc body and press Shift-Caps Lock again.\n", stderr)
+        log("set target failed: no immediate focused or mouse Google Docs window")
+        return false
     }
 
     fputs("Click the target Google Docs window now. Waiting up to 5 seconds...\n", stderr)
@@ -781,7 +798,6 @@ private func currentBrowserWindowInfo(appName: String, bundleIdentifier: String?
     let script = """
     tell application "\(appleScriptEscaped(appName))"
       set w to front window
-      if visible of w is false then return ""
       set tabNumber to active tab index of w
       set t to active tab of w
       set b to bounds of w
@@ -789,7 +805,7 @@ private func currentBrowserWindowInfo(appName: String, bundleIdentifier: String?
     end tell
     """
 
-    guard let output = runAppleScript(script) else { return nil }
+    guard let output = runAppleScript(script, timeout: 6.0) else { return nil }
     let lines = output.components(separatedBy: "\n")
     guard lines.count >= 4, let windowID = Int(lines[0]), let tabIndex = Int(lines[1]) else {
         return nil
@@ -1018,13 +1034,14 @@ private func readSelectedTextFromFocusedElement(source: SourceWindow) -> String?
     return text
 }
 
-private func focusTargetDocument() -> FocusedTarget? {
+private func focusTargetDocument(sourceBrowser: BrowserWindowInfo?) -> FocusedTarget? {
     if let target = loadTarget() {
         log("target candidate: \(target.title) window=\(target.windowID) tab=\(target.tabIndex)")
-        if let focused = focusSavedTarget(target) {
+        if let focused = focusSavedTarget(target, sourceBrowser: sourceBrowser) {
             return focused
         }
         log("saved target focus failed")
+        return nil
     }
 
     for browser in chromiumBrowserNames {
@@ -1037,9 +1054,14 @@ private func focusTargetDocument() -> FocusedTarget? {
     return nil
 }
 
-private func focusSavedTarget(_ target: TargetDocument) -> FocusedTarget? {
+private func focusSavedTarget(_ target: TargetDocument, sourceBrowser: BrowserWindowInfo?) -> FocusedTarget? {
+    if target.appName == "ChatGPT Atlas",
+       let focused = focusTargetByOpeningURL(target, sourceBrowser: sourceBrowser) {
+        return focused
+    }
+
     if focusBrowserTab(target.browserWindowInfo) {
-        return FocusedTarget(info: target.browserWindowInfo, focusPoint: target.focusPoint)
+        return FocusedTarget(info: currentBrowserWindowInfo(appName: target.appName, bundleIdentifier: target.bundleIdentifier) ?? target.browserWindowInfo, focusPoint: target.focusPoint, restoreSource: nil)
     }
 
     if matchingOnScreenWindow(for: target) != nil {
@@ -1047,16 +1069,19 @@ private func focusSavedTarget(_ target: TargetDocument) -> FocusedTarget? {
         _ = raiseProcessWindow(appName: target.appName)
         _ = shell("/usr/bin/open -a \(shellQuoted(target.appName))")
         Thread.sleep(forTimeInterval: 0.35)
-        return waitForKeyboardFocus(appName: target.appName)
-            ? FocusedTarget(info: target.browserWindowInfo, focusPoint: target.focusPoint)
-            : nil
+        if waitForKeyboardFocus(appName: target.appName) && frontBrowserMatches(target.browserWindowInfo) {
+            return FocusedTarget(info: currentBrowserWindowInfo(appName: target.appName, bundleIdentifier: target.bundleIdentifier) ?? target.browserWindowInfo, focusPoint: target.focusPoint, restoreSource: nil)
+        }
+        log("onscreen target focus mismatch")
     }
 
     if let currentInfo = findOpenTab(url: target.url, appName: target.appName) {
-        return focusBrowserTab(currentInfo) ? FocusedTarget(info: currentInfo, focusPoint: target.focusPoint) : nil
+        if focusBrowserTab(currentInfo) {
+            return FocusedTarget(info: currentBrowserWindowInfo(appName: currentInfo.appName, bundleIdentifier: currentInfo.bundleIdentifier) ?? currentInfo, focusPoint: target.focusPoint, restoreSource: nil)
+        }
     }
 
-    return nil
+    return focusTargetByOpeningURL(target, sourceBrowser: sourceBrowser)
 }
 
 private func findOpenTab(url: String, appName: String) -> BrowserWindowInfo? {
@@ -1081,6 +1106,15 @@ private func googleDocumentID(_ url: String) -> String? {
     return id?.isEmpty == false ? id : nil
 }
 
+private func isSameGoogleDocument(_ lhs: String, _ rhs: String) -> Bool {
+    if lhs == rhs { return true }
+    guard let lhsDocumentID = googleDocumentID(lhs),
+          let rhsDocumentID = googleDocumentID(rhs) else {
+        return false
+    }
+    return lhsDocumentID == rhsDocumentID
+}
+
 private func focusFirstGoogleDocsWindow(appName: String) -> FocusedTarget? {
     if onScreenWindows(appName: appName)
         .contains(where: { $0.title.localizedCaseInsensitiveContains("Google Docs") }) {
@@ -1090,12 +1124,12 @@ private func focusFirstGoogleDocsWindow(appName: String) -> FocusedTarget? {
         Thread.sleep(forTimeInterval: 0.35)
         if waitForKeyboardFocus(appName: appName),
            let info = topOnScreenGoogleDocsWindow(appName: appName) {
-            return FocusedTarget(info: info, focusPoint: nil)
+            return FocusedTarget(info: info, focusPoint: nil, restoreSource: nil)
         }
     }
 
     if let info = topOnScreenGoogleDocsWindow(appName: appName) {
-        return focusBrowserTab(info) ? FocusedTarget(info: info, focusPoint: nil) : nil
+        return focusBrowserTab(info) ? FocusedTarget(info: info, focusPoint: nil, restoreSource: nil) : nil
     }
 
     return nil
@@ -1108,6 +1142,56 @@ private func currentOnScreenGoogleDocsWindow() -> BrowserWindowInfo? {
         }
     }
     return nil
+}
+
+private func currentVisibleBrowserWindowInfo(appName: String, bundleIdentifier: String?) -> BrowserWindowInfo? {
+    guard chromiumBrowserNames.contains(appName),
+          let window = frontOnScreenWindow(appName: appName) else {
+        return nil
+    }
+
+    let bundleID = bundleIdentifier ?? NSWorkspace.shared.runningApplications
+        .first { $0.localizedName == appName }?
+        .bundleIdentifier
+
+    let script = """
+    set fieldDelimiter to ASCII character 9
+    tell application "\(appleScriptEscaped(appName))"
+      repeat with w in windows
+        if (name of w as text) is "\(appleScriptEscaped(window.title))" then
+          set tabNumber to active tab index of w
+          set t to active tab of w
+          set b to bounds of w
+          set boundsText to (item 1 of b as text) & "," & (item 2 of b as text) & "," & (item 3 of b as text) & "," & (item 4 of b as text)
+          return (id of w as text) & fieldDelimiter & (tabNumber as text) & fieldDelimiter & (title of t as text) & fieldDelimiter & (URL of t as text) & fieldDelimiter & boundsText
+        end if
+      end repeat
+    end tell
+    return ""
+    """
+
+    guard let output = runAppleScript(script, timeout: 2.0)?
+        .trimmingCharacters(in: .whitespacesAndNewlines),
+        !output.isEmpty else {
+        return nil
+    }
+
+    let parts = output.split(separator: "\t", maxSplits: 4, omittingEmptySubsequences: false)
+    guard parts.count >= 4,
+          let windowID = Int(parts[0]),
+          let tabIndex = Int(parts[1]) else {
+        return nil
+    }
+
+    return BrowserWindowInfo(
+        appName: appName,
+        bundleIdentifier: bundleID,
+        windowID: windowID,
+        tabIndex: tabIndex,
+        title: String(parts[2]),
+        url: String(parts[3]),
+        bounds: parts.count >= 5 ? parseBounds(String(parts[4])) : window.bounds
+    )
 }
 
 private func topOnScreenGoogleDocsWindow(appName: String) -> BrowserWindowInfo? {
@@ -1161,7 +1245,162 @@ private func focusBrowserTab(_ info: BrowserWindowInfo) -> Bool {
     _ = shell("/usr/bin/open -a \(shellQuoted(info.appName))")
     let front = waitForKeyboardFocus(appName: info.appName)
     log("target front check: \(front ? "ok" : "failed") ns=\(NSWorkspace.shared.frontmostApplication?.localizedName ?? "(none)") se=\(systemEventsFrontmostProcessName() ?? "(none)")")
-    return front
+    guard front else { return false }
+
+    if !frontBrowserMatches(info) {
+        let current = currentBrowserWindowInfo(appName: info.appName, bundleIdentifier: info.bundleIdentifier)
+        log("target front mismatch: wanted \(info.url) got \(current?.url ?? "(unknown)")")
+        return false
+    }
+
+    return true
+}
+
+private func frontBrowserMatches(_ info: BrowserWindowInfo) -> Bool {
+    guard let current = currentBrowserWindowInfo(appName: info.appName, bundleIdentifier: info.bundleIdentifier) else {
+        return false
+    }
+
+    guard frontOnScreenWindowMatches(info: info, current: current) else {
+        log("target front visual mismatch: screen=\(frontOnScreenWindow(appName: info.appName)?.title ?? "(none)")")
+        return false
+    }
+
+    if current.url == info.url { return true }
+    if let expectedDocumentID = googleDocumentID(info.url),
+       let currentDocumentID = googleDocumentID(current.url) {
+        return expectedDocumentID == currentDocumentID
+    }
+
+    return false
+}
+
+private func frontOnScreenWindowMatches(info: BrowserWindowInfo, current: BrowserWindowInfo) -> Bool {
+    guard let window = frontOnScreenWindow(appName: info.appName) else { return false }
+
+    if window.title == current.title || window.title == info.title {
+        return true
+    }
+
+    if isGoogleDocumentURL(info.url),
+       isGoogleDocumentURL(current.url),
+       window.title.localizedCaseInsensitiveContains("Google Docs") {
+        return true
+    }
+
+    return false
+}
+
+private func frontOnScreenWindow(appName: String) -> OnScreenWindow? {
+    onScreenWindows(appName: appName).first
+}
+
+private func focusTargetByOpeningURL(_ target: TargetDocument, sourceBrowser: BrowserWindowInfo?) -> FocusedTarget? {
+    guard chromiumBrowserNames.contains(target.appName),
+          openURLInBrowser(appName: target.appName, bundleIdentifier: target.bundleIdentifier, url: target.url, expectedDocumentURL: target.url) else {
+        return focusTargetByReplacingSourceTab(target, sourceBrowser: sourceBrowser)
+    }
+
+    let current = currentBrowserWindowInfo(appName: target.appName, bundleIdentifier: target.bundleIdentifier) ?? target.browserWindowInfo
+    let restoreSource = sourceBrowser.flatMap { source -> BrowserWindowInfo? in
+        guard source.appName == target.appName,
+              !isGoogleDocumentURL(source.url) else {
+            return nil
+        }
+        return source
+    }
+    log("target focused by opening URL")
+    return FocusedTarget(info: current, focusPoint: target.focusPoint, restoreSource: restoreSource)
+}
+
+private func focusTargetByReplacingSourceTab(_ target: TargetDocument, sourceBrowser: BrowserWindowInfo?) -> FocusedTarget? {
+    let browserToReplace = sourceBrowser ?? currentBrowserWindowInfo(appName: target.appName, bundleIdentifier: target.bundleIdentifier)
+    guard let sourceBrowser = browserToReplace,
+          sourceBrowser.appName == target.appName,
+          chromiumBrowserNames.contains(sourceBrowser.appName),
+          !isGoogleDocumentURL(sourceBrowser.url) else {
+        log("target fallback unavailable")
+        return nil
+    }
+
+    log("target fallback: opening target in source tab")
+    let result = runAppleScript("""
+    tell application "\(appleScriptEscaped(target.appName))"
+      try
+        set w to window id \(sourceBrowser.windowID)
+        set active tab index of w to \(sourceBrowser.tabIndex)
+        set index of w to 1
+        set URL of active tab of w to "\(appleScriptEscaped(target.url))"
+        activate
+        return "ok"
+      end try
+    end tell
+    return "missing"
+    """)
+
+    guard result?.trimmingCharacters(in: .whitespacesAndNewlines) == "ok" else {
+        log("target fallback script failed: \(result ?? "nil")")
+        return nil
+    }
+
+    _ = activateApp(appName: target.appName, bundleIdentifier: target.bundleIdentifier)
+    navigateFrontTabToURL(target.url)
+    let deadline = Date().addingTimeInterval(6.0)
+    while Date() < deadline {
+        if let current = currentBrowserWindowInfo(appName: target.appName, bundleIdentifier: target.bundleIdentifier),
+           isSameGoogleDocument(current.url, target.url) {
+            log("target fallback loaded")
+            return FocusedTarget(info: current, focusPoint: target.focusPoint, restoreSource: sourceBrowser)
+        }
+        Thread.sleep(forTimeInterval: 0.15)
+    }
+
+    log("target fallback load timed out")
+    return nil
+}
+
+private func restoreBrowserSource(_ source: BrowserWindowInfo) {
+    guard chromiumBrowserNames.contains(source.appName), !source.url.isEmpty else {
+        returnToSource(SourceWindow(appName: source.appName, bundleIdentifier: source.bundleIdentifier, processIdentifier: nil, windowID: source.windowID))
+        return
+    }
+
+    log("restoring source browser tab")
+    if !openURLInBrowser(appName: source.appName, bundleIdentifier: source.bundleIdentifier, url: source.url, expectedDocumentURL: nil) {
+        returnToSource(SourceWindow(appName: source.appName, bundleIdentifier: source.bundleIdentifier, processIdentifier: nil, windowID: source.windowID))
+    }
+}
+
+private func openURLInBrowser(appName: String, bundleIdentifier: String?, url: String, expectedDocumentURL: String?) -> Bool {
+    _ = shell("/usr/bin/open -a \(shellQuoted(appName)) \(shellQuoted(url))")
+    _ = activateApp(appName: appName, bundleIdentifier: bundleIdentifier)
+
+    let deadline = Date().addingTimeInterval(8.0)
+    while Date() < deadline {
+        if let expectedDocumentURL {
+            if let current = currentBrowserWindowInfo(appName: appName, bundleIdentifier: bundleIdentifier),
+               isSameGoogleDocument(current.url, expectedDocumentURL),
+               frontOnScreenWindowMatches(info: current, current: current) {
+                return true
+            }
+        } else if isFrontmostApp(named: appName) {
+            return true
+        }
+        Thread.sleep(forTimeInterval: 0.15)
+    }
+
+    log("open URL timed out: \(url)")
+    return false
+}
+
+private func navigateFrontTabToURL(_ url: String) {
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(url, forType: .string)
+    keyCombo(keyCodeL, flags: .maskCommand)
+    Thread.sleep(forTimeInterval: 0.1)
+    keyCombo(keyCodeV, flags: .maskCommand)
+    Thread.sleep(forTimeInterval: 0.1)
+    keyCombo(keyCodeReturn, flags: [])
 }
 
 private func isBrowserWindowOnScreen(_ info: BrowserWindowInfo) -> Bool {
@@ -1606,6 +1845,7 @@ private func usage() {
       CapsDocsCapture --trigger-daemon          Ask the running daemon to capture once
       CapsDocsCapture --once                    Capture selected text once
       CapsDocsCapture --set-target              Save the focused Google Docs window
+      CapsDocsCapture --set-target-wait         Wait briefly, then save the clicked Google Docs window
       CapsDocsCapture --set-target-url TEXT     Save the open Doc whose URL contains TEXT
       CapsDocsCapture --set-target-title TEXT   Save the open Doc whose title contains TEXT
       CapsDocsCapture --list-docs               List open Google Docs documents
@@ -1629,6 +1869,8 @@ if arguments.contains("--daemon") {
     exit(controller.captureOnce() ? 0 : 1)
 } else if arguments.contains("--set-target") {
     exit(setTargetToFrontDocument() ? 0 : 1)
+} else if arguments.contains("--set-target-wait") {
+    exit(setTargetToFrontDocument(allowWait: true) ? 0 : 1)
 } else if let index = rawArguments.firstIndex(of: "--set-target-url"),
           rawArguments.indices.contains(index + 1) {
     exit(setTargetBySearch(rawArguments[index + 1], mode: .url) ? 0 : 1)
