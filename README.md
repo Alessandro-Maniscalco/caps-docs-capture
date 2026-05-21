@@ -1,25 +1,72 @@
 # CapsDocsCapture
 
-Local macOS helper for this workflow:
+macOS helper for sending highlighted text into the current cursor position in
+Google Docs.
 
-1. Put the cursor in the Google Doc where notes should be inserted.
-2. Press Shift-Caps Lock to save that Google Doc as the target.
-3. Highlight text in another window.
-4. Press Caps Lock.
-5. The selected text is copied, pasted into the saved Google Docs window, and focus returns to the source app when possible.
+## Workflow
 
-## Installed Files
+1. Start the daemon.
+2. Click in the Google Doc where notes should be inserted.
+3. Press Shift-Caps Lock to save that Docs window as the target.
+4. Highlight text in another app or browser window.
+5. Press Caps Lock to paste the selected text into the saved Docs target.
+
+After each capture, focus returns to the source app when possible.
+
+## Install
+
+```sh
+./install.sh
+```
+
+Installed files:
 
 - Binary: `~/Library/Application Support/CapsDocsCapture/CapsDocsCapture`
 - Config and logs: `~/.caps-docs-capture/`
+- Karabiner rule: `~/.config/karabiner/karabiner.json`
 
-## Commands
+The helper needs macOS Accessibility permission to send copy/paste keystrokes,
+and Input Monitoring permission to receive raw Caps Lock key events. Add this
+binary to both entries:
 
-Build:
+```text
+System Settings > Privacy & Security > Accessibility
+System Settings > Privacy & Security > Input Monitoring
+~/Library/Application Support/CapsDocsCapture/CapsDocsCapture
+```
+
+Restart the daemon after changing permissions.
+
+## Daily Commands
+
+Start the daemon:
 
 ```sh
-swift build -c release
+~/Library/Application\ Support/CapsDocsCapture/CapsDocsCapture --daemon
 ```
+
+The daemon enables the Karabiner-Elements Caps Lock rule while it is running,
+then restores Caps Lock when it stops. It automatically quits after 1 hour.
+
+Stop it manually:
+
+```sh
+~/Library/Application\ Support/CapsDocsCapture/CapsDocsCapture --stop
+```
+
+Watch logs:
+
+```sh
+tail -f ~/.caps-docs-capture/capture.log
+```
+
+Show current configuration:
+
+```sh
+~/Library/Application\ Support/CapsDocsCapture/CapsDocsCapture --status
+```
+
+## Target Commands
 
 Save the currently focused Google Doc as the target:
 
@@ -27,10 +74,9 @@ Save the currently focused Google Doc as the target:
 ~/Library/Application\ Support/CapsDocsCapture/CapsDocsCapture --set-target
 ```
 
-When the daemon is running, you can also click the Google Doc and press
-Shift-Caps Lock to save it as the target.
+When the daemon is running, Shift-Caps Lock does the same thing.
 
-Save a specific open Google Doc by URL/document id:
+Save a specific open Google Doc by URL or document ID:
 
 ```sh
 ~/Library/Application\ Support/CapsDocsCapture/CapsDocsCapture --set-target-url DOC_ID_OR_URL_FRAGMENT
@@ -42,61 +88,39 @@ List open Google Docs:
 ~/Library/Application\ Support/CapsDocsCapture/CapsDocsCapture --list-docs
 ```
 
-Install the helper:
+## Testing
+
+Build:
 
 ```sh
-./install.sh
+swift build -c release
 ```
 
-Start the interactive daemon:
-
-```sh
-~/Library/Application\ Support/CapsDocsCapture/CapsDocsCapture --daemon
-```
-
-Starting the daemon enables the Karabiner-Elements Caps Lock rule by setting
-`caps_docs_capture_enabled=1`. Stopping it disables that rule so Caps Lock goes
-back to normal.
-
-The daemon automatically quits after 1 hour and restores Caps Lock.
-
-Stop it:
-
-```sh
-~/Library/Application\ Support/CapsDocsCapture/CapsDocsCapture --stop
-```
-
-Trigger the running daemon once for testing:
+Trigger the running daemon once:
 
 ```sh
 ~/Library/Application\ Support/CapsDocsCapture/CapsDocsCapture --trigger-daemon
 ```
 
-The primary Caps Lock hotkey is a Karabiner-Elements complex modification at:
+Capture once without the daemon:
 
-```text
-~/.config/karabiner/karabiner.json
+```sh
+~/Library/Application\ Support/CapsDocsCapture/CapsDocsCapture --once
 ```
 
-It runs the installed helper with `--once` when Caps Lock is tapped alone, and
-with `--set-target` when Shift-Caps Lock is pressed. Both shortcuts require
-`caps_docs_capture_enabled` to be set. `--stop` also clears any previous Caps
-Lock remapping left from older versions.
+## How It Works
 
-## Permissions
+The Karabiner-Elements complex modification maps Caps Lock while the daemon is
+running:
 
-The helper needs macOS Accessibility permission to send copy/paste keystrokes, and Input Monitoring permission to receive raw Caps Lock key events. Add this binary to both entries in:
+- Caps Lock: capture selected text and paste it into the saved Docs target.
+- Shift-Caps Lock: save the focused Google Docs window as the target.
 
-```text
-System Settings > Privacy & Security > Accessibility
-System Settings > Privacy & Security > Input Monitoring
-~/Library/Application Support/CapsDocsCapture/CapsDocsCapture
-```
+The helper intentionally uses the live Google Docs cursor instead of the Google
+Docs API. The target Docs window should be visible or focusable, and its cursor
+should already be placed where the next capture should land.
 
-Then restart the daemon.
-
-## Notes
-
-This intentionally uses the live Google Docs cursor instead of the Google Docs API. The target Docs window should be visible or focusable, and the cursor should already be placed where the next capture should land.
-
-The helper is intentionally run as an interactive daemon instead of a LaunchAgent. On current macOS, the LaunchAgent process can start but does not receive the same Accessibility/Input Monitoring privileges needed to copy the selected text from the foreground app.
+The daemon runs interactively instead of as a LaunchAgent. On current macOS, a
+LaunchAgent process can start but may not receive the same
+Accessibility/Input Monitoring privileges needed to copy selected text from the
+foreground app.
