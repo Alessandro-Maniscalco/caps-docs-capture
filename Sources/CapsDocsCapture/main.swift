@@ -10,6 +10,7 @@ private let supportDirectory = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent(".caps-docs-capture", isDirectory: true)
 private let targetFile = supportDirectory.appendingPathComponent("target.json")
 private let logFile = supportDirectory.appendingPathComponent("capture.log")
+private let karabinerLogFile = supportDirectory.appendingPathComponent("karabiner.log")
 private let launchAgentFile = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent("Library/LaunchAgents/com.alessandro.CapsDocsCapture.plist")
 private let triggerNotificationName = Notification.Name("com.alessandro.CapsDocsCapture.trigger")
@@ -493,8 +494,10 @@ private func setTargetToFrontDocument() -> Bool {
     if let info = currentBrowserWindowInfo() {
         fputs("The focused browser tab is not a Google Docs document.\n", stderr)
         fputs("Focused URL: \(info.url)\n", stderr)
+        log("set target failed: focused browser tab is not Google Docs: \(info.url)")
     } else {
         fputs("No focused or visible Google Docs window found in a supported browser.\n", stderr)
+        log("set target failed: no focused or visible Google Docs window")
     }
     return false
 }
@@ -554,6 +557,7 @@ private func setTargetBySearch(_ query: String, mode: TargetSearchMode) -> Bool 
     }
 
     fputs("No matching Google Docs document found for query: \(query)\n", stderr)
+    log("set target failed: no match for \(mode == .url ? "url" : "title") query \(query)")
     return false
 }
 
@@ -583,9 +587,20 @@ private func status() {
         print("Target: none saved; first open Google Doc will be used")
     }
 
+    let daemonPIDs = shell("pgrep -f '/CapsDocsCapture --daemon' 2>/dev/null || true")
+        .split(whereSeparator: \.isNewline)
+        .map(String.init)
+    print("Daemon running: \(daemonPIDs.isEmpty ? "no" : "yes (pid \(daemonPIDs.joined(separator: ", ")))")")
+    print("Karabiner CLI: \(FileManager.default.isExecutableFile(atPath: karabinerCLIPath) ? "yes" : "not found")")
+    print("Capture log: \(logFile.path)")
+    print("Karabiner event log: \(karabinerLogFile.path)")
+
     let mapping = shell("/usr/bin/hidutil property --get UserKeyMapping")
-    print("Caps Lock mapping:")
-    print(mapping.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "(none)" : mapping)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    if !mapping.isEmpty, mapping != "(\n)" {
+        print("Legacy hidutil Caps Lock mapping:")
+        print(mapping)
+    }
 }
 
 private func requestAccessibility() {
@@ -1261,6 +1276,7 @@ private func saveTarget(_ target: TargetDocument) -> Bool {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
         try encoder.encode(target).write(to: targetFile, options: .atomic)
+        log("saved target: \(target.title) \(target.url)")
         return true
     } catch {
         log("target save error: \(error)")

@@ -54,10 +54,16 @@ Stop it manually:
 ~/Library/Application\ Support/CapsDocsCapture/CapsDocsCapture --stop
 ```
 
-Watch logs:
+Watch app logs:
 
 ```sh
 tail -f ~/.caps-docs-capture/capture.log
+```
+
+Watch Karabiner shortcut events:
+
+```sh
+tail -f ~/.caps-docs-capture/karabiner.log
 ```
 
 Show current configuration:
@@ -79,8 +85,12 @@ When the daemon is running, Shift-Caps Lock does the same thing.
 Save a specific open Google Doc by URL or document ID:
 
 ```sh
-~/Library/Application\ Support/CapsDocsCapture/CapsDocsCapture --set-target-url DOC_ID_OR_URL_FRAGMENT
+~/Library/Application\ Support/CapsDocsCapture/CapsDocsCapture --set-target-url 'DOC_ID_OR_URL_FRAGMENT'
 ```
+
+Quote full URLs. In zsh, an unquoted `?tab=t.0` is treated as a filename
+pattern before CapsDocsCapture can read it. Passing only the document ID avoids
+that issue.
 
 List open Google Docs:
 
