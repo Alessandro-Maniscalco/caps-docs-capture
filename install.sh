@@ -27,16 +27,17 @@ cat <<EOF
 Installed CapsDocsCapture.
 
 Next:
-1. Add this app to Accessibility and Input Monitoring if macOS prompts:
+1. Add this binary to Accessibility if macOS prompts:
    $BIN
-2. Save your notes doc target:
-   "$BIN" --set-target
+2. Connect Google Docs (one time). See DESIGN.md for the Cloud setup:
+   "$BIN" --google-auth /path/to/client_secret_*.json
 3. Make sure Karabiner-Elements has this complex modification enabled in:
    ~/.config/karabiner/karabiner.json
-4. Start the interactive daemon:
+4. Start the daemon:
    "$BIN" --daemon
+5. Click in your notes Doc and press Shift-Caps Lock to set the target.
 
-Keep that terminal process running while you capture notes. Stop it with Ctrl-C or:
+Keep the daemon process running while you capture notes. Stop it with Ctrl-C or:
    "$BIN" --stop
 
 EOF

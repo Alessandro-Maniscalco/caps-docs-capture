@@ -1,17 +1,20 @@
 # CapsDocsCapture
 
-macOS helper for sending highlighted text into the current cursor position in
-Google Docs.
+macOS helper that sends highlighted text from any app into one Google Doc,
+using two hotkeys. See [DESIGN.md](DESIGN.md) for the idea and architecture.
 
 ## Workflow
 
-1. Start the daemon.
-2. Click in the Google Doc body where notes should be inserted.
-3. Press Shift-Caps Lock to save that Docs window and body click point as the target.
-4. Highlight text in another app or browser window.
-5. Press Caps Lock to paste the selected text into the saved Docs target.
+1. Start the daemon (enables the hotkeys for 1 hour).
+2. Click in your notes Doc where captures should start, then press
+   **Shift-Caps Lock** to save it as the target.
+3. Switch to any other app or window and highlight some text.
+4. Press **Caps Lock**. The text is written into the target Doc via the Google
+   Docs API. Focus does not change — you stay where you are.
 
-After each capture, focus returns to the source app when possible.
+Captures land at an invisible anchor placed where your cursor was. The anchor is
+real document text, so you can type your own notes between captures and the next
+capture still continues from the anchor.
 
 ## Install
 
@@ -22,22 +25,35 @@ After each capture, focus returns to the source app when possible.
 Installed files:
 
 - Binary: `~/Library/Application Support/CapsDocsCapture/CapsDocsCapture`
-- Config and logs: `~/.caps-docs-capture/`
+- Target, tokens, logs: `~/.caps-docs-capture/`
 - Karabiner rule: `~/.config/karabiner/karabiner.json`
 
-The helper needs macOS Accessibility permission to send copy/paste keystrokes,
-and Input Monitoring permission to receive raw Caps Lock key events. Add this
-binary to both entries:
+The helper needs macOS **Accessibility** permission to read selected text and
+send keystrokes. Add the binary in:
 
 ```text
 System Settings > Privacy & Security > Accessibility
-System Settings > Privacy & Security > Input Monitoring
 ~/Library/Application Support/CapsDocsCapture/CapsDocsCapture
 ```
 
-Restart the daemon after changing permissions.
+## Connect Google Docs (one time)
 
-## Daily Commands
+1. Create a project at <https://console.cloud.google.com/>.
+2. Enable the **Google Docs API** (APIs & Services > Library).
+3. Configure the **OAuth consent screen** (User type *External*; add your own
+   account as a test user). Set publishing status to *In production* to avoid
+   re-authorizing every 7 days.
+4. Create an **OAuth client ID** of type **Desktop app** (APIs & Services >
+   Credentials) and download its `client_secret_*.json`.
+5. Run:
+
+```sh
+~/Library/Application\ Support/CapsDocsCapture/CapsDocsCapture --google-auth /path/to/client_secret_*.json
+```
+
+A browser window opens; approve access. Tokens are stored and auto-refreshed.
+
+## Daily commands
 
 Start the daemon:
 
@@ -45,62 +61,41 @@ Start the daemon:
 ~/Library/Application\ Support/CapsDocsCapture/CapsDocsCapture --daemon
 ```
 
-The daemon enables the Karabiner-Elements Caps Lock rule while it is running,
-then restores Caps Lock when it stops. It automatically quits after 1 hour.
-
+Keep that process running while you capture notes. It auto-quits after 1 hour.
 Stop it manually:
 
 ```sh
 ~/Library/Application\ Support/CapsDocsCapture/CapsDocsCapture --stop
 ```
 
-Watch app logs:
-
-```sh
-tail -f ~/.caps-docs-capture/capture.log
-```
-
-Watch Karabiner shortcut events:
-
-```sh
-tail -f ~/.caps-docs-capture/karabiner.log
-```
-
-Show current configuration:
+Show configuration:
 
 ```sh
 ~/Library/Application\ Support/CapsDocsCapture/CapsDocsCapture --status
 ```
 
-## Target Commands
+Watch the log:
 
-Save the currently focused Google Doc as the target:
+```sh
+tail -f ~/.caps-docs-capture/capture.log
+```
+
+## Target commands
+
+Save the focused Google Doc as the target (same as Shift-Caps Lock). The Doc
+must be the front browser tab with your cursor in the body:
 
 ```sh
 ~/Library/Application\ Support/CapsDocsCapture/CapsDocsCapture --set-target
 ```
 
-When the daemon is running, Shift-Caps Lock does the same thing. The mouse
-must be inside the document body, not on the toolbar or browser tabs, so the
-helper can safely refocus the editor before pasting.
-
-Save a specific open Google Doc by URL or document ID:
+Save a Doc by URL or document ID (no cursor anchor; captures append to the end):
 
 ```sh
-~/Library/Application\ Support/CapsDocsCapture/CapsDocsCapture --set-target-url 'DOC_ID_OR_URL_FRAGMENT'
+~/Library/Application\ Support/CapsDocsCapture/CapsDocsCapture --set-target-url 'DOC_ID_OR_URL'
 ```
 
-Quote full URLs. In zsh, an unquoted `?tab=t.0` is treated as a filename
-pattern before CapsDocsCapture can read it. Passing only the document ID avoids
-that issue. This command saves the document target only; use Shift-Caps Lock
-after clicking in the document body when `--status` shows `Target body click
-point: not saved`.
-
-List open Google Docs:
-
-```sh
-~/Library/Application\ Support/CapsDocsCapture/CapsDocsCapture --list-docs
-```
+Quote full URLs.
 
 ## Testing
 
@@ -110,32 +105,22 @@ Build:
 swift build -c release
 ```
 
-Trigger the running daemon once:
-
-```sh
-~/Library/Application\ Support/CapsDocsCapture/CapsDocsCapture --trigger-daemon
-```
-
-Capture once without the daemon:
+Capture once without a hotkey:
 
 ```sh
 ~/Library/Application\ Support/CapsDocsCapture/CapsDocsCapture --once
 ```
 
-## How It Works
+## How it works
 
-The Karabiner-Elements complex modification maps Caps Lock while the daemon is
-running:
+Karabiner-Elements maps the hotkeys to short-lived helper processes while the
+daemon is running:
 
-- Caps Lock: capture selected text and paste it into the saved Docs target.
-- Shift-Caps Lock: save the focused Google Docs window as the target.
+- **Caps Lock** runs `--once`: read the selected text, then insert it into the
+  target Doc through the Google Docs API.
+- **Shift-Caps Lock** runs `--set-target`: read the front browser tab's URL,
+  drop an invisible anchor at the cursor, and save the Doc.
 
-The helper intentionally uses the live Google Docs cursor instead of the Google
-Docs API. The target Docs window should be visible or focusable. For reliable
-pasting, save a target body click point with Shift-Caps Lock after placing the
-cursor where the next capture should land.
-
-The daemon runs interactively instead of as a LaunchAgent. On current macOS, a
-LaunchAgent process can start but may not receive the same
-Accessibility/Input Monitoring privileges needed to copy selected text from the
-foreground app.
+The tool writes through the Docs API instead of switching browser tabs and
+pasting. This works even when the Doc is in ChatGPT Atlas (which is not fully
+AppleScript-scriptable) or in a different window, and it never steals focus.
