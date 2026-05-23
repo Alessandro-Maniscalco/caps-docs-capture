@@ -19,11 +19,6 @@ private let karabinerCLIPath = "/Library/Application Support/org.pqrs/Karabiner-
 private let karabinerEnabledVariable = "caps_docs_capture_enabled"
 private let daemonAutoQuitInterval: TimeInterval = 60 * 60
 
-// A run of six zero-width spaces. Invisible in the document, but unique enough
-// that the Docs API can locate it reliably and treat it as the live insertion
-// anchor.
-private let anchorMarker = String(repeating: "\u{200B}", count: 6)
-
 private let docsScope = "https://www.googleapis.com/auth/documents"
 
 private let keyCodeC: CGKeyCode = 8
@@ -39,7 +34,20 @@ private struct Target: Codable {
     var documentId: String
     var title: String
     var hasAnchor: Bool
+    // Per-session invisible marker (zero-width characters). Each --set-target
+    // generates a fresh, statistically-unique sequence; that way captures find
+    // the right anchor instantly without scanning for stale ones from earlier
+    // presses. Optional for backward compatibility with older target.json files.
+    var anchorMarker: String?
     var createdAt: Date
+}
+
+// Characters that are zero-width and invisible in Google Docs. Used to build
+// a unique per-session anchor sequence.
+private let anchorAlphabet: [Character] = ["\u{200B}", "\u{200C}", "\u{200D}", "\u{2060}"]
+
+private func generateAnchorMarker(length: Int = 16) -> String {
+    String((0..<length).map { _ in anchorAlphabet.randomElement()! })
 }
 
 private struct GoogleTokens: Codable {
@@ -117,7 +125,7 @@ private func captureOnce() -> Bool {
     let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
     log("captured \(text.count) chars")
 
-    guard let document = getDocument(target.documentId, token: token) else {
+    guard let document = getDocument(target.documentId, token: token, fields: docFieldsMaskForCapture) else {
         log("capture failed: could not read target Doc")
         notify(title: "Could not open target Doc",
                body: "Check Doc sharing or re-run --set-target.")
@@ -125,13 +133,14 @@ private func captureOnce() -> Bool {
         return false
     }
 
-    let model = documentModel(document)
     let requests: [[String: Any]]
-    if target.hasAnchor, let anchorIndex = model.anchorIndex {
-        requests = [["insertText": ["text": text + "\n", "location": ["index": anchorIndex]]]]
-        log("inserting \(text.count) chars at anchor index \(anchorIndex)")
+    if target.hasAnchor,
+       let marker = target.anchorMarker,
+       let anchor = anchorIndex(in: document, marker: marker) {
+        requests = [["insertText": ["text": text + "\n", "location": ["index": anchor]]]]
+        log("inserting \(text.count) chars at anchor index \(anchor)")
     } else {
-        let index = max(1, model.endIndex - 1)
+        let index = max(1, endIndex(of: document) - 1)
         requests = [["insertText": ["text": "\n" + text, "location": ["index": index]]]]
         log("appending \(text.count) chars at end index \(index)")
     }
@@ -213,28 +222,49 @@ private func setTargetFromFrontTab() -> Bool {
         return false
     }
 
-    // Place the anchor while the caret is still in the Doc body, then read the
-    // browser's address bar with the keyboard. AppleScript tab control is
-    // unreliable in some browsers (notably ChatGPT Atlas), so it is not used.
+    // Generate a fresh marker for this session. Because it is statistically
+    // unique, captures find it instantly and there is no need to clean up
+    // markers left by earlier presses (they remain in the doc as invisible
+    // bytes; cosmetic only).
+    let marker = generateAnchorMarker()
+
+    // Paste the anchor at the current caret (the Doc body has focus), then
+    // read the URL via Cmd-L / Cmd-C / Esc. The clipboard is restored after.
     let snapshot = PasteboardSnapshot()
-    placeAnchorAtCursor()
-    let url = frontTabURLViaKeyboard()
+    placeAnchorAtCursor(marker: marker)
+    let urlOptional = frontTabURLViaKeyboard()
     snapshot.restore()
 
-    guard let url, !url.isEmpty else {
-        fputs("Could not read the front browser tab's URL.\n", stderr)
-        log("set-target failed: could not read front tab URL")
-        NSSound.beep()
-        return false
-    }
-    guard let documentId = googleDocumentID(url) else {
-        fputs("The front tab is not a Google Doc: \(url)\n", stderr)
-        log("set-target failed: front tab is not a Google Doc: \(url)")
+    guard let url = urlOptional, !url.isEmpty,
+          let documentId = googleDocumentID(url) else {
+        fputs("The front tab is not a Google Doc: \(urlOptional ?? "(no URL)")\n", stderr)
+        log("set-target failed: front tab URL not a Google Doc: \(urlOptional ?? "nil")")
         NSSound.beep()
         return false
     }
     log("set-target: front tab document id \(documentId)")
-    return saveTargetDocument(documentId: documentId, token: token, anchorPlaced: true)
+
+    // Cheap access + title check (fields=title is tiny even on a 200-page Doc).
+    guard let title = getDocumentTitle(documentId, token: token) else {
+        fputs(accessDeniedMessage(documentId), stderr)
+        log("set-target failed: getDocument denied for \(documentId)")
+        NSSound.beep()
+        return false
+    }
+
+    // Save immediately. Even if a Caps Lock follows right away, --once reads
+    // the up-to-date documentId/marker; if Docs has not yet flushed the paste,
+    // --once silently falls back to append-to-end.
+    let target = Target(documentId: documentId, title: title,
+                        hasAnchor: true, anchorMarker: marker, createdAt: Date())
+    guard saveTarget(target) else {
+        fputs("Could not save the target.\n", stderr)
+        return false
+    }
+
+    print("Saved target Doc: \(title)")
+    print("Captures will be inserted at your cursor anchor.")
+    return true
 }
 
 private func setTargetByURL(_ argument: String) -> Bool {
@@ -248,61 +278,37 @@ private func setTargetByURL(_ argument: String) -> Bool {
         fputs("Could not read a Google document ID from: \(argument)\n", stderr)
         return false
     }
-    return saveTargetDocument(documentId: documentId, token: token, anchorPlaced: false)
-}
-
-private func saveTargetDocument(documentId: String, token: String, anchorPlaced: Bool) -> Bool {
-    // Verify the connected Google account can actually open this Doc before
-    // saving it. A target that 403s is worse than no change at all.
-    guard let document = getDocument(documentId, token: token) else {
-        fputs("""
-        Could not open that Google Doc (\(documentId)).
-        The connected Google account does not have access to it.
-        Open the Doc with the account you connected to CapsDocsCapture, share the
-        Doc with that account, or re-run --google-auth with the right account.
-        The previous target was left unchanged.
-
-        """, stderr)
-        log("set-target failed: getDocument denied for \(documentId)")
-        NSSound.beep()
+    guard let title = getDocumentTitle(documentId, token: token) else {
+        fputs(accessDeniedMessage(documentId), stderr)
+        log("set-target-url failed: getDocument denied for \(documentId)")
         return false
     }
 
-    let title = (document["title"] as? String) ?? "Google Doc"
-    var hasAnchor = false
-    if anchorPlaced {
-        hasAnchor = documentModel(document).anchorIndex != nil
-        var attempt = 0
-        while !hasAnchor, attempt < 10 {
-            attempt += 1
-            Thread.sleep(forTimeInterval: 0.3)
-            if let refreshed = getDocument(documentId, token: token),
-               documentModel(refreshed).anchorIndex != nil {
-                hasAnchor = true
-                log("anchor confirmed after \(attempt) retr(ies)")
-            }
-        }
-        if !hasAnchor {
-            log("anchor not confirmed; using append-to-end mode")
-        }
-    }
-
-    let target = Target(documentId: documentId, title: title, hasAnchor: hasAnchor, createdAt: Date())
+    let target = Target(documentId: documentId, title: title,
+                        hasAnchor: false, anchorMarker: nil, createdAt: Date())
     guard saveTarget(target) else {
         fputs("Could not save the target.\n", stderr)
         return false
     }
-
     print("Saved target Doc: \(title)")
-    print(hasAnchor
-        ? "Captures will be inserted at your cursor anchor."
-        : "Captures will be appended to the end of the document.")
+    print("Captures will be appended to the end of the document.")
     return true
 }
 
-private func placeAnchorAtCursor() {
+private func accessDeniedMessage(_ documentId: String) -> String {
+    """
+    Could not open that Google Doc (\(documentId)).
+    The connected Google account does not have access to it.
+    Open the Doc with the account you connected to CapsDocsCapture, share the
+    Doc with that account, or re-run --google-auth with the right account.
+    The previous target was left unchanged.
+
+    """
+}
+
+private func placeAnchorAtCursor(marker: String) {
     NSPasteboard.general.clearContents()
-    NSPasteboard.general.setString(anchorMarker, forType: .string)
+    NSPasteboard.general.setString(marker, forType: .string)
     Thread.sleep(forTimeInterval: 0.05)
 
     keyCombo(keyCodeV, flags: .maskCommand)
@@ -310,7 +316,7 @@ private func placeAnchorAtCursor() {
 
     // Move the editor caret back in front of the anchor so the user's own
     // typing and the next capture both land at the same spot.
-    for _ in 0..<anchorMarker.utf16.count {
+    for _ in 0..<marker.utf16.count {
         keyCombo(keyCodeLeftArrow, flags: [])
     }
     Thread.sleep(forTimeInterval: 0.15)
@@ -364,12 +370,10 @@ private func googleDocumentID(_ urlOrId: String) -> String? {
 
 // MARK: - Google Docs document model
 
-private struct DocumentModel {
-    var anchorIndex: Int?
-    var endIndex: Int
-}
-
-private func documentModel(_ document: [String: Any]) -> DocumentModel {
+// Build a parallel (utf16-unit, doc-index) view of all text-run content in
+// the body. Returns the units, the per-unit doc index, and the document's
+// final end index.
+private func documentTextUnits(_ document: [String: Any]) -> (units: [UInt16], indexMap: [Int], endIndex: Int) {
     var units: [UInt16] = []
     var indexMap: [Int] = []
     var endIndex = 1
@@ -399,27 +403,40 @@ private func documentModel(_ document: [String: Any]) -> DocumentModel {
             }
         }
     }
+    return (units, indexMap, endIndex)
+}
 
-    var anchorIndex: Int?
-    let markerUnits = Array(anchorMarker.utf16)
-    if !markerUnits.isEmpty, units.count >= markerUnits.count {
-        for i in 0...(units.count - markerUnits.count) {
-            if Array(units[i ..< i + markerUnits.count]) == markerUnits {
-                anchorIndex = indexMap[i]
-                break
-            }
+// First occurrence of the per-session marker, as a doc API index, or nil.
+private func anchorIndex(in document: [String: Any], marker: String) -> Int? {
+    let (units, indexMap, _) = documentTextUnits(document)
+    let markerUnits = Array(marker.utf16)
+    guard !markerUnits.isEmpty, units.count >= markerUnits.count else { return nil }
+    for i in 0...(units.count - markerUnits.count) {
+        if Array(units[i ..< i + markerUnits.count]) == markerUnits {
+            return indexMap[i]
         }
     }
+    return nil
+}
 
-    return DocumentModel(anchorIndex: anchorIndex, endIndex: endIndex)
+private func endIndex(of document: [String: Any]) -> Int {
+    documentTextUnits(document).endIndex
 }
 
 // MARK: - Google Docs API
 
-private func getDocument(_ documentId: String, token: String) -> [String: Any]? {
-    guard let url = URL(string: "https://docs.googleapis.com/v1/documents/\(documentId)") else {
-        return nil
+// Trimmed field mask for captures: returns only what is needed to locate the
+// anchor and find the end of the document. On large Docs this is much smaller
+// than the full response.
+private let docFieldsMaskForCapture =
+    "title,body/content(endIndex,paragraph/elements(startIndex,textRun/content))"
+
+private func getDocument(_ documentId: String, token: String, fields: String? = nil) -> [String: Any]? {
+    var components = URLComponents(string: "https://docs.googleapis.com/v1/documents/\(documentId)")
+    if let fields {
+        components?.queryItems = [URLQueryItem(name: "fields", value: fields)]
     }
+    guard let url = components?.url else { return nil }
     var request = URLRequest(url: url)
     request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
 
@@ -432,6 +449,15 @@ private func getDocument(_ documentId: String, token: String) -> [String: Any]? 
         return nil
     }
     return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+}
+
+// Fast access + title check. fields=title returns a tiny payload even on a
+// 200-page Doc, so set-target stays snappy.
+private func getDocumentTitle(_ documentId: String, token: String) -> String? {
+    guard let document = getDocument(documentId, token: token, fields: "title") else {
+        return nil
+    }
+    return (document["title"] as? String) ?? "Google Doc"
 }
 
 private func batchUpdate(_ documentId: String, requests: [[String: Any]], token: String) -> Bool {
