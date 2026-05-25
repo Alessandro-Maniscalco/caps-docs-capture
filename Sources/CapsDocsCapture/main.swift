@@ -140,9 +140,15 @@ private func captureOnce() -> Bool {
         requests = [["insertText": ["text": text + "\n", "location": ["index": anchor]]]]
         log("inserting \(text.count) chars at anchor index \(anchor)")
     } else {
-        let index = max(1, endIndex(of: document) - 1)
-        requests = [["insertText": ["text": "\n" + text, "location": ["index": index]]]]
-        log("appending \(text.count) chars at end index \(index)")
+        // Append to the body as a new paragraph: the API's
+        // endOfSegmentLocation places the text after the doc's final
+        // paragraph break, so "text\n" lands on its own fresh line with the
+        // newline trailing (matching the anchor-mode order).
+        requests = [["insertText": [
+            "text": text + "\n",
+            "endOfSegmentLocation": ["segmentId": ""],
+        ]]]
+        log("appending \(text.count) chars at end of body")
     }
 
     guard batchUpdate(target.documentId, requests: requests, token: token) else {
